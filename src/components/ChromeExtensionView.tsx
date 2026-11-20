@@ -125,10 +125,10 @@ export function ChromeExtensionView() {
           </li>
           <li className="space-y-1">
             <span className="font-semibold text-slate-900 block">
-              03. Scegli Locale o Cloud
+              03. Avvia il server sul PC (:3000)
             </span>
             <span>
-              Clicca sull'icona LinguaBridge in alto a destra in Chrome: se non hai avviato il server sul PC con <span className="font-mono">Avvia_LinguaBridge.bat</span>, clicca <strong>Usa Cloud</strong> e poi <strong>Testa</strong>.
+              L'URL di anteprima <span className="font-mono">ais-dev-...</span> è privato (richiede login Google). Estrai lo ZIP completo, fai doppio clic su <span className="font-mono">Avvia_LinguaBridge.bat</span> (o <span className="font-mono">.command</span>) e nel popup clicca <strong>Usa Locale (:3000)</strong>.
             </span>
           </li>
         </ol>

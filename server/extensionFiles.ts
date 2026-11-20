@@ -4,14 +4,14 @@ export function buildChromeExtensionFiles(serverOrigin: string) {
   const manifestJson = `{
   "manifest_version": 3,
   "name": "LinguaBridge per WhatsApp Web",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Traduce automaticamente in tempo reale le conversazioni su WhatsApp Web.",
   "permissions": ["storage", "activeTab"],
   "host_permissions": [
     "https://web.whatsapp.com/*",
     "http://localhost:3000/*",
     "http://127.0.0.1:3000/*",
-    "${cleanOrigin}/*"
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -32,7 +32,7 @@ export function buildChromeExtensionFiles(serverOrigin: string) {
 
   const backgroundJs = `// LinguaBridge MV3 Service Worker (evita blocchi CSP di web.whatsapp.com)
 const DEFAULT_SETTINGS = {
-  serverUrl: "${cleanOrigin}",
+  serverUrl: "http://localhost:3000",
   targetLang: "Italiano",
   outgoingLang: "Inglese",
   autoTranslate: true
@@ -43,16 +43,42 @@ async function getSettings() {
   return { ...DEFAULT_SETTINGS, ...stored };
 }
 
+function formatNetworkError(baseUrl, errMsg) {
+  if (baseUrl.includes("ais-dev-") || baseUrl.includes("ais-pre-")) {
+    return "L'URL di anteprima AI Studio è privato (protetto da login Google). Avvia il server sul tuo PC con Avvia_LinguaBridge.bat e usa http://localhost:3000";
+  }
+  if (baseUrl.includes("localhost") || baseUrl.includes("127.0.0.1")) {
+    return "Server locale non avviato: esegui Avvia_LinguaBridge.bat (Windows) o .command (Mac) dalla cartella dello ZIP.";
+  }
+  return errMsg || "Server non raggiungibile";
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "CHECK_HEALTH") {
     (async () => {
+      const settings = await getSettings();
+      const base = (msg.serverUrl || settings.serverUrl).replace(/\\/+$/, "");
       try {
-        const settings = await getSettings();
-        const base = (msg.serverUrl || settings.serverUrl).replace(/\\/+$/, "");
-        const res = await fetch(base + "/api/health", { method: "GET" });
-        sendResponse({ ok: res.ok, status: res.status, serverUrl: base });
+        const res = await fetch(base + "/api/health", {
+          method: "GET",
+          signal: AbortSignal.timeout(5000)
+        });
+        const ct = res.headers.get("content-type") || "";
+        if (!res.ok || !ct.includes("application/json")) {
+          sendResponse({
+            ok: false,
+            networkError: true,
+            error: formatNetworkError(base, "Risposta non valida (" + res.status + ")")
+          });
+          return;
+        }
+        sendResponse({ ok: true, status: res.status, serverUrl: base });
       } catch (err) {
-        sendResponse({ ok: false, error: err?.message || "Server non raggiungibile" });
+        sendResponse({
+          ok: false,
+          networkError: true,
+          error: formatNetworkError(base, err?.message)
+        });
       }
     })();
     return true;
@@ -60,12 +86,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg?.type === "TRANSLATE_MESSAGE") {
     (async () => {
+      const settings = await getSettings();
+      const base = settings.serverUrl.replace(/\\/+$/, "");
       try {
-        const settings = await getSettings();
-        const base = settings.serverUrl.replace(/\\/+$/, "");
         const res = await fetch(base + "/api/translate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(22000),
           body: JSON.stringify({
             text: msg.text,
             sourceLang: msg.sourceLang || "auto",
@@ -73,14 +100,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             tone: msg.tone || "naturale"
           })
         });
+        const ct = res.headers.get("content-type") || "";
+        if (!ct.includes("application/json")) {
+          sendResponse({
+            ok: false,
+            networkError: true,
+            error: formatNetworkError(base, "Risposta non JSON (" + res.status + ")")
+          });
+          return;
+        }
         const data = await res.json();
         if (!res.ok) {
-          sendResponse({ ok: false, error: data?.error || "Errore API " + res.status });
+          const isBusy = res.status === 429 || res.status === 503 || res.status === 504;
+          sendResponse({
+            ok: false,
+            networkError: false,
+            transientBusy: isBusy,
+            error: data?.error || "Errore API " + res.status
+          });
           return;
         }
         sendResponse({ ok: true, data });
       } catch (err) {
-        sendResponse({ ok: false, error: err?.message || "Connessione al server fallita" });
+        sendResponse({
+          ok: false,
+          networkError: true,
+          error: formatNetworkError(base, err?.message)
+        });
       }
     })();
     return true;
@@ -95,14 +141,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   const processedNodes = new WeakSet();
   const translationCache = new Map();
+  const pendingQueue = [];
+  let activeRequests = 0;
+  const MAX_CONCURRENT = 3;
+  let scanTimer = null;
+
   let settings = {
-    serverUrl: "${cleanOrigin}",
+    serverUrl: "http://localhost:3000",
     targetLang: "Italiano",
     outgoingLang: "Inglese",
     autoTranslate: true
   };
   let serverOnline = null;
-  let lastError = "";
+  let isBusy = false;
 
   const SELECTORS = [
     '[data-testid="msg-container"] span.selectable-text',
@@ -126,12 +177,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   function updateStatusUI() {
     const statusEl = document.getElementById("lb-status-text");
     if (!statusEl) return;
-    if (serverOnline === true) {
-      statusEl.textContent = "Connesso (" + settings.targetLang + ")";
-      statusEl.style.color = "#0f766e";
-    } else if (serverOnline === false) {
+    if (serverOnline === false) {
       statusEl.textContent = "Server offline — clicca l'icona LinguaBridge o avvia il server";
       statusEl.style.color = "#b91c1c";
+    } else if (isBusy) {
+      statusEl.textContent = "Connesso · AI occupata, coda in corso...";
+      statusEl.style.color = "#b45309";
+    } else if (serverOnline === true) {
+      statusEl.textContent = "Connesso (" + settings.targetLang + ")";
+      statusEl.style.color = "#0f766e";
     } else {
       statusEl.textContent = "Verifica server...";
       statusEl.style.color = "#475569";
@@ -139,16 +193,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   function checkServerHealth() {
-    chrome.runtime.sendMessage({ type: "CHECK_HEALTH" }, (resp) => {
-      if (chrome.runtime.lastError || !resp?.ok) {
-        serverOnline = false;
-        lastError = resp?.error || "Server non raggiungibile";
-      } else {
-        serverOnline = true;
-        lastError = "";
-      }
-      updateStatusUI();
-    });
+    try {
+      chrome.runtime.sendMessage({ type: "CHECK_HEALTH" }, (resp) => {
+        if (chrome.runtime.lastError) {
+          // Extension worker waking up or invalidated: only flag offline if persistent
+          return;
+        }
+        serverOnline = Boolean(resp?.ok);
+        updateStatusUI();
+      });
+    } catch {
+      // Ignore invalidated extension context after extension reload until tab refresh
+    }
   }
 
   function renderTranslationUnderNode(msgNode, translatedText, detectedLang) {
@@ -174,11 +230,77 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     msgNode.parentElement.appendChild(badge);
   }
 
+  function pumpQueue() {
+    while (activeRequests < MAX_CONCURRENT && pendingQueue.length > 0) {
+      const task = pendingQueue.shift();
+      activeRequests++;
+      runTranslationTask(task).finally(() => {
+        activeRequests--;
+        pumpQueue();
+      });
+    }
+  }
+
+  function runTranslationTask({ msgNode, original, cacheKey, retried }) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(
+          {
+            type: "TRANSLATE_MESSAGE",
+            text: original,
+            targetLang: settings.targetLang
+          },
+          (resp) => {
+            if (chrome.runtime.lastError) {
+              resolve();
+              return;
+            }
+            if (!resp?.ok) {
+              if (resp?.transientBusy) {
+                isBusy = true;
+                serverOnline = true;
+                updateStatusUI();
+                if (!retried) {
+                  setTimeout(() => {
+                    pendingQueue.push({ msgNode, original, cacheKey, retried: true });
+                    pumpQueue();
+                  }, 1800);
+                }
+              } else if (resp?.networkError) {
+                serverOnline = false;
+                updateStatusUI();
+              }
+              resolve();
+              return;
+            }
+
+            isBusy = false;
+            serverOnline = true;
+            updateStatusUI();
+            const data = resp.data;
+            if (data?.translatedText) {
+              translationCache.set(cacheKey, data);
+              const sameText =
+                data.translatedText.trim().toLowerCase() === original.trim().toLowerCase();
+              if (!sameText) {
+                renderTranslationUnderNode(msgNode, data.translatedText, data.detectedLanguage);
+              }
+            }
+            resolve();
+          }
+        );
+      } catch {
+        resolve();
+      }
+    });
+  }
+
   function translateMessageNode(msgNode, force = false) {
     if (!settings.autoTranslate && !force) return;
     if (!force && processedNodes.has(msgNode)) return;
     const original = (msgNode.innerText || "").trim();
-    if (!original || original.length < 2) return;
+    // Skip timestamps, pure numbers, or tiny 1-char tokens
+    if (!original || original.length < 2 || /^[0-9:.,/\\s-]+$/.test(original)) return;
     processedNodes.add(msgNode);
 
     const cacheKey = settings.targetLang + "::" + original;
@@ -190,32 +312,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return;
     }
 
-    chrome.runtime.sendMessage(
-      {
-        type: "TRANSLATE_MESSAGE",
-        text: original,
-        targetLang: settings.targetLang
-      },
-      (resp) => {
-        if (chrome.runtime.lastError || !resp?.ok) {
-          serverOnline = false;
-          lastError = resp?.error || "Errore connessione";
-          updateStatusUI();
-          return;
-        }
-        serverOnline = true;
-        updateStatusUI();
-        const data = resp.data;
-        if (!data?.translatedText) return;
-        translationCache.set(cacheKey, data);
-
-        const sameText =
-          data.translatedText.trim().toLowerCase() === original.trim().toLowerCase();
-        if (!sameText) {
-          renderTranslationUnderNode(msgNode, data.translatedText, data.detectedLanguage);
-        }
-      }
-    );
+    pendingQueue.push({ msgNode, original, cacheKey, retried: false });
+    pumpQueue();
   }
 
   function translateVisibleMessages(force = true) {
@@ -249,7 +347,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       (resp) => {
         if (btn) btn.textContent = "Traduci bozza (" + settings.outgoingLang + ")";
         if (chrome.runtime.lastError || !resp?.ok) {
-          serverOnline = false;
+          if (resp?.networkError) {
+            serverOnline = false;
+          }
           updateStatusUI();
           alert("Errore traduzione: " + (resp?.error || "Server non raggiungibile"));
           return;
@@ -337,9 +437,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     translateVisibleMessages(true);
   });
 
+  setInterval(() => {
+    if (serverOnline === false) {
+      checkServerHealth();
+    }
+  }, 20000);
+
   const observer = new MutationObserver(() => {
     injectToolbar();
-    translateVisibleMessages(false);
+    if (scanTimer) clearTimeout(scanTimer);
+    scanTimer = setTimeout(() => {
+      translateVisibleMessages(false);
+    }, 300);
   });
   observer.observe(document.body, { childList: true, subtree: true });
 })();
@@ -372,8 +481,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     <input id="serverUrl" type="text" placeholder="http://localhost:3000" />
     <div class="row">
       <button type="button" id="presetLocal">Usa Locale (:3000)</button>
-      <button type="button" id="presetCloud">Usa Cloud</button>
+      <button type="button" id="presetCloud">URL Anteprima</button>
     </div>
+    <p style="font-size:10.5px;color:#64748b;margin:5px 0 0;line-height:1.35;">
+      Avvia <strong>Avvia_LinguaBridge.bat</strong> (dallo ZIP) sul PC e usa <code>http://localhost:3000</code>. Gli URL privati <code>ais-dev-...</code> sono protetti da login Google.
+    </p>
 
     <label for="targetLang">Traduci messaggi ricevuti in</label>
     <select id="targetLang">
@@ -422,7 +534,7 @@ const statusBox = document.getElementById("statusBox");
 
 chrome.storage.local.get(
   {
-    serverUrl: CLOUD_ORIGIN,
+    serverUrl: "http://localhost:3000",
     targetLang: "Italiano",
     outgoingLang: "Inglese",
     autoTranslate: true
@@ -445,7 +557,7 @@ document.getElementById("presetCloud").addEventListener("click", () => {
 
 document.getElementById("saveBtn").addEventListener("click", () => {
   const cfg = {
-    serverUrl: serverInput.value.trim().replace(/\\/+$/, "") || CLOUD_ORIGIN,
+    serverUrl: serverInput.value.trim().replace(/\\/+$/, "") || "http://localhost:3000",
     targetLang: targetSelect.value,
     outgoingLang: outgoingSelect.value,
     autoTranslate: autoCheck.checked
@@ -457,12 +569,12 @@ document.getElementById("saveBtn").addEventListener("click", () => {
 });
 
 document.getElementById("testBtn").addEventListener("click", () => {
-  const url = serverInput.value.trim().replace(/\\/+$/, "") || CLOUD_ORIGIN;
+  const url = serverInput.value.trim().replace(/\\/+$/, "") || "http://localhost:3000";
   statusBox.textContent = "Verifica connessione a " + url + "...";
   statusBox.style.color = "#475569";
   chrome.runtime.sendMessage({ type: "CHECK_HEALTH", serverUrl: url }, (resp) => {
     if (chrome.runtime.lastError || !resp?.ok) {
-      statusBox.textContent = "Non raggiungibile: " + (resp?.error || "avvia il server o usa Cloud");
+      statusBox.textContent = "Non raggiungibile: " + (resp?.error || "avvia Avvia_LinguaBridge.bat sul PC");
       statusBox.style.color = "#b91c1c";
     } else {
       statusBox.textContent = "Connesso correttamente al server LinguaBridge!";

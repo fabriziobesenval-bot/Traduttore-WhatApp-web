@@ -267,14 +267,18 @@ async function startServer() {
     next();
   });
 
-  // Rate limit API endpoints
+  // Rate limit API endpoints (exempt local loopback so desktop WhatsApp Web extension never hits false 429s)
   app.use("/api/", (req, res, next) => {
-    if (req.path === "/events") {
+    if (req.path === "/events" || req.path === "/health") {
       next();
       return;
     }
     const clientIp = req.ip || req.socket.remoteAddress || "unknown";
-    if (!checkRateLimit(clientIp, 60, 60_000)) {
+    const isLoopback =
+      clientIp === "127.0.0.1" ||
+      clientIp === "::1" ||
+      clientIp === "::ffff:127.0.0.1";
+    if (!isLoopback && !checkRateLimit(clientIp, 240, 60_000)) {
       res.status(429).json({ error: "Troppe richieste in un minuto. Riprova tra poco." });
       return;
     }

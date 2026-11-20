@@ -5,7 +5,7 @@ import JSZip from "jszip";
 import { buildChromeExtensionFiles } from "./extensionFiles";
 
 const EXCLUDED_DIRS = new Set(["node_modules", "dist", ".git", ".aistudio", ".next"]);
-const EXCLUDED_FILES = new Set([".env", ".env.local", ".env.production", "server.js"]);
+const EXCLUDED_FILES = new Set([".env", ".env.local", ".env.production", "server.js", "bun.lock"]);
 
 export function generateInstallationPdfBuffer(serverOrigin: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -231,11 +231,15 @@ export async function generateFullPackageZip(
     "",
     'if not exist "node_modules" (',
     "  echo [1/3] Installazione dipendenze al primo avvio...",
-    "  call npm install",
+    "  call npm install --no-audit --no-fund",
     "  if errorlevel 1 (",
-    "    echo [ERRORE] Installazione dipendenze fallita.",
-    "    pause",
-    "    exit /b 1",
+    "    echo Riprovo con --legacy-peer-deps...",
+    "    call npm install --legacy-peer-deps --no-audit --no-fund",
+    "    if errorlevel 1 (",
+    "      echo [ERRORE] Installazione dipendenze fallita.",
+    "      pause",
+    "      exit /b 1",
+    "    )",
     "  )",
     ")",
     "",
@@ -276,7 +280,7 @@ export async function generateFullPackageZip(
     "",
     'if [ ! -d "node_modules" ]; then',
     '  echo "[1/3] Installazione dipendenze al primo avvio..."',
-    "  npm install",
+    "  npm install --no-audit --no-fund || npm install --legacy-peer-deps --no-audit --no-fund",
     "fi",
     "",
     'if [ ! -f ".env" ]; then',
@@ -381,12 +385,12 @@ app.on("window-all-closed", () => {
     "title LinguaBridge - Generatore Installer .EXE",
     'cd /d "%~dp0.."',
     "echo [1/4] Installazione dipendenze app web...",
-    "call npm install",
+    "call npm install --no-audit --no-fund || call npm install --legacy-peer-deps --no-audit --no-fund",
     "echo [2/4] Compilazione frontend di produzione...",
     "call npm run build",
     'cd /d "%~dp0"',
     "echo [3/4] Installazione Electron Builder...",
-    "call npm install",
+    "call npm install --no-audit --no-fund || call npm install --legacy-peer-deps --no-audit --no-fund",
     "echo [4/4] Creazione installer Windows (.exe)...",
     "call npm run build:win",
     "echo.",
@@ -406,10 +410,19 @@ app.on("window-all-closed", () => {
   zip.file("chrome-extension/popup.html", ext.popupHtml);
   zip.file("chrome-extension/popup.js", ext.popupJs);
 
+  // Add .npmrc so Windows/macOS npm never fails on optional peer conflicts
+  zip.file(".npmrc", "legacy-peer-deps=true\n");
+
   // 6. Full-stack source code (excluding secrets and build artifacts)
   const files = collectProjectFiles(projectRoot);
   for (const relPath of files) {
     const normalized = relPath.split(path.sep).join("/");
+    if (normalized === "package.json") {
+      const pkgRaw = fs.readFileSync(path.join(projectRoot, relPath), "utf8");
+      const pkgFixed = pkgRaw.replace(/"esbuild":\s*"\^0\.25\.0"/, '"esbuild": "^0.28.0"');
+      zip.file(normalized, pkgFixed);
+      continue;
+    }
     const content = fs.readFileSync(path.join(projectRoot, relPath));
     zip.file(normalized, content);
   }
