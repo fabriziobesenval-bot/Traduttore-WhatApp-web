@@ -1,0 +1,6 @@
+{
+  "name": "LinguaBridge",
+  "description": "Piattaforma di traduzione simultanea per conversazioni WhatsApp con motore Gemini, bridge Webhook Cloud API ed estensione WhatsApp Web.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
